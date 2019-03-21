@@ -1,0 +1,5 @@
+name: keras-vis
+
+dependencies:
+  - python=3.6
+  - tensorflow
