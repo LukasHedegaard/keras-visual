@@ -1,14 +1,9 @@
 #!/usr/bin/env python
 #coding=utf-8
-###########################################################
-# Modified from https://github.com/jalused/Deconvnet-keras/
-###########################################################
 
-import argparse
 import numpy as np
-import sys
-from PIL import Image
-from typing import (List, Tuple, Callable)
+from typing import List
+import tensorflow as tf
 from tensorflow.keras.layers import (
     Input,
     InputLayer,
@@ -17,19 +12,19 @@ from tensorflow.keras.layers import (
     Dense
 )
 from tensorflow.keras.layers import (
-    Convolution2D,
-    MaxPooling2D
+    Conv2D, 
+    Conv2DTranspose,
+    MaxPooling2D, 
+    UpSampling2D
 )
-from tensorflow.keras.activations import *
 from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.applications import vgg16
 import tensorflow.keras.backend as K
 
 
-class DLayer():
+class VisLayer():
     ''' Abstract base class for deconv layers'''
-    up_func: Callable = lambda arg: None
-    down_func: Callable = lambda arg: None
+    up_func = lambda arg: None
+    down_func = lambda arg: None
     name: str = ''
 
     def up(self, data, learning_phase = 0):
@@ -41,45 +36,42 @@ class DLayer():
         return self.down_data
 
 
-class DConvolution2D(DLayer):
-    def __init__(self, layer: Convolution2D):
+class VisConv2D(VisLayer):
+    
+    def __init__(self, layer):
+
         self.layer = layer
         self.name = layer.name
 
-        weights = layer.get_weights()
-        W = weights[0]
-        b = weights[1]
-
-        # Set up_func for DConvolution2D
-        up_kernel_size = tuple(W.shape[0:2])
-        up_filters = W.shape[3]
+        W, b = layer.get_weights()
         i = Input(shape = layer.input_shape[1:])
-        o = Convolution2D(
-            filters = up_filters, 
-            kernel_size = up_kernel_size, 
-            padding = 'same',
-        )(i)
-        o.weights=[W,b]
-        self.up_func = K.function([i, K.learning_phase()], o)
+        u = Conv2D(
+            filters = layer.filters, 
+            kernel_size = layer.kernel_size, 
+            strides = layer.strides,
+            dilation_rate = layer.dilation_rate,
+            padding = layer.padding,
+            kernel_initializer = tf.constant_initializer(W),
+            bias_initializer = tf.constant_initializer(b),
+        )
+        self.up_func = K.function([i, K.learning_phase()], u(i))
 
-        # Flip W horizontally and vertically, 
-        # and set down_func for DConvolution2D
-        W = np.transpose(W, (0, 1, 3, 2))
-        W = W[::-1, ::-1, :, :]
-        down_kernel_size = tuple(W.shape[0:2])
-        down_filters = W.shape[3]
-        b = np.zeros(down_filters)
-        i = Input(shape = layer.output_shape[1:])
-        o = Convolution2D(
-            filters = down_filters, 
-            kernel_size = down_kernel_size, 
-            padding = 'same',
-        )(i)
-        o.weights = [W,b]
-        self.down_func = K.function([i, K.learning_phase()], o)
-    
+        W_t = np.moveaxis(W[::-1, ::-1, :, :], 2, 3) 
+        b_t = np.zeros(W_t.shape[3])
+        o = Input(shape = layer.output_shape[1:])
+        d = Conv2D(
+            filters = W_t.shape[-1], 
+            kernel_size = W_t.shape[:2], 
+            strides = layer.strides,
+            dilation_rate = layer.dilation_rate,
+            padding = layer.padding,
+            kernel_initializer=tf.constant_initializer(W_t),
+            bias_initializer=tf.constant_initializer(b_t),
+        )
+        self.down_func = K.function([o, K.learning_phase()], d(o))
 
-class DDense(DLayer):
+
+class VisDense(VisLayer):
     def __init__(self, layer: Dense):
         self.layer = layer
         self.name = layer.name
@@ -104,91 +96,44 @@ class DDense(DLayer):
         o = Dense(units = self.input_shape[1])(i)
         o.weights = flipped_weights
         self.down_func = K.function([i, K.learning_phase()], o)
-    
 
-class DPooling(DLayer):
+
+class VisMaxPooling2D(VisLayer):
     def __init__(self, layer: MaxPooling2D):
         self.layer = layer
         self.name = layer.name
         self.poolsize = layer.pool_size
+
+        # set up functions
+        inp = Input(shape = layer.input_shape[1:])
+        pool = MaxPooling2D(
+            pool_size = layer.pool_size,
+            strides = layer.strides,
+            padding = layer.padding,
+            data_format = 'channels_last'
+        )
+        self._maxpool = K.function([inp, K.learning_phase()], pool(inp))
+
+        out = inp = Input(shape = layer.output_shape[1:])
+        ups_factor = int(layer.input_shape[1]/layer.output_shape[1])
+        ups = UpSampling2D(size=(ups_factor, ups_factor))
+        self._upsample = K.function([out, K.learning_phase()], ups(out))
+        
+        self._switches = np.zeros((1, *layer.input_shape[1:]))
     
+
     def up(self, data, learning_phase = 0):
-        [self.up_data, self.switch] = self.__max_pooling_with_switch(data, self.poolsize)
+        self.up_data = self._maxpool([data, learning_phase])
+        self._switches = data == self._upsample([self.up_data, learning_phase])
         return self.up_data
+    
 
     def down(self, data, learning_phase = 0):
-        self.down_data = self.__max_unpooling_with_switch(data, self.switch)
+        self.down_data = self._upsample([data, learning_phase]) * self._switches
         return self.down_data
 
-    def __max_pooling_with_switch(self, inp, poolsize):
-        '''
-        Compute pooling output and switch in forward pass, switch stores 
-        location of the maximum value in each poolsize * poolsize block
-        # Arguments
-            inp: data to be pooled
-            poolsize: size of pooling operation
-        # Returns
-            Pooled result and Switch
-        '''
-        i = np.moveaxis(inp,3,1)
 
-        switch = np.zeros(i.shape)
-        out_shape = list(i.shape)
-        row_poolsize = int(poolsize[0])
-        col_poolsize = int(poolsize[1])
-        out_shape[2] = int(out_shape[2] / poolsize[0])
-        out_shape[3] = int(out_shape[3] / poolsize[1])
-        pooled = np.zeros(out_shape)
-        
-        for sample in range(i.shape[0]):
-            for dim in range(i.shape[1]):
-                for row in range(out_shape[2]):
-                    for col in range(out_shape[3]):
-                        patch = i[sample, 
-                                dim, 
-                                row * row_poolsize : (row + 1) * row_poolsize,
-                                col * col_poolsize : (col + 1) * col_poolsize]
-                        max_value = patch.max()
-                        pooled[sample, dim, row, col] = max_value
-                        max_col_index = patch.argmax(axis = 1)
-                        max_cols = patch.max(axis = 1)
-                        max_row = max_cols.argmax()
-                        max_col = max_col_index[max_row]
-                        switch[sample, 
-                                dim, 
-                                row * row_poolsize + max_row, 
-                                col * col_poolsize + max_col]  = 1
-        
-        pooled = np.moveaxis(pooled,1,3)
-        switch = np.moveaxis(switch,1,3)
-        return [pooled, switch]
-
-
-    # Compute unpooled output using pooled data and switch
-    def __max_unpooling_with_switch(self, inp, switch):
-        '''
-        Compute unpooled output using pooled data and switch
-        # Arguments
-            inp: data to be pooled
-            poolsize: size of pooling operation
-            switch: switch storing location of each elements
-        # Returns
-            Unpooled result
-        '''
-        i = np.moveaxis(inp,3,1)
-        switch = np.moveaxis(switch,3,1)
-
-        tile = np.ones((int(switch.shape[2] / i.shape[2]), 
-                        int(switch.shape[3] / i.shape[3])))
-        out = np.kron(i, tile)
-        unpooled = out * switch
-
-        unpooled = np.moveaxis(unpooled,1,3)
-        return unpooled
-
-
-
-class DActivation(DLayer):
+class VisActivation(VisLayer):
     def __init__(self, layer: Activation, linear = False):
         self.layer = layer
         self.name = layer.name
@@ -196,14 +141,14 @@ class DActivation(DLayer):
         self.activation = layer.activation
         i = K.placeholder(shape = layer.output_shape)
 
-        o = self.activation(i)
+        a = self.activation(i)
         # According to the original paper, 
         # In forward pass and backward pass, do the same activation(relu)
-        self.up_func = K.function([i, K.learning_phase()], o)
-        self.down_func = K.function([i, K.learning_phase()], o)
+        self.up_func = K.function([i, K.learning_phase()], a)
+        self.down_func = K.function([i, K.learning_phase()], a)
     
     
-class DFlatten(DLayer):
+class VisFlatten(VisLayer):
     def __init__(self, layer: Flatten):
         self.layer = layer
         self.name = layer.name
@@ -223,7 +168,7 @@ class DFlatten(DLayer):
         return self.down_data
 
 
-class DInput(DLayer):
+class VisInput(VisLayer):
     def __init__(self, layer: Input):
         self.layer = layer
         self.name = layer.name
@@ -238,29 +183,28 @@ class DInput(DLayer):
         return self.down_data
 
 
-class VisualModel():
-    layers: List[DLayer] = []
+class VisModel():
+    layers: List[VisLayer] = []
 
     def __init__(self, model: Model
                      , layer_name = ''):
-        self.save_image = save_image
         self.layer_name = layer_name
 
         for l in model.layers:
-            if   isinstance(l, Convolution2D):
-                self.layers.append(DConvolution2D(l))
-                self.layers.append(DActivation(l))
+            if   isinstance(l, Conv2D):
+                self.layers.append(VisConv2D(l))
+                self.layers.append(VisActivation(l))
             elif isinstance(l, MaxPooling2D):
-                self.layers.append(DPooling(l))
+                self.layers.append(VisMaxPooling2D(l))
             elif isinstance(l, Dense):
-                self.layers.append(DDense(l))
-                self.layers.append(DActivation(l))
+                self.layers.append(VisDense(l))
+                self.layers.append(VisActivation(l))
             elif isinstance(l, Activation):
-                self.layers.append(DActivation(l))
+                self.layers.append(VisActivation(l))
             elif isinstance(l, Flatten):
-                self.layers.append(DFlatten(l))
+                self.layers.append(VisFlatten(l))
             elif isinstance(l, InputLayer):
-                self.layers.append(DInput(l))
+                self.layers.append(VisInput(l))
             else:
                 raise ValueError(f'Cannot handle this type of layer: \n{l.get_config()}')
             if l.name == layer_name:
@@ -272,9 +216,9 @@ class VisualModel():
                       , max_only = False
                       , save_img = lambda img, name: None ):
         up_data = self.up(data)
-        for i, f, d in self.get_top_features(up_data, top_n, max_only):
+        for rank, feat, d in self.get_top_features(up_data, top_n, max_only):
             down_data = self.down(d)
-            save_img(down_data.squeeze(), f'top{i}_feature{f}')
+            save_img(np.array(down_data).squeeze(), rank+1, feat)
 
 
     def up(self, data):
@@ -316,64 +260,3 @@ class VisualModel():
 
         return self.layers[0].down_data
         
-
-    
-def argparser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('image', help = 'Path of image to visualize')
-    parser.add_argument('--layer_name', '-l', 
-            action = 'store', dest = 'layer_name', 
-            default = 'block5_conv3', help = 'Layer to visualize')
-    parser.add_argument('--feature', '-f', 
-            action = 'store', dest = 'feature', 
-            default = 0, type = int, help = 'Feature to visualize')
-    parser.add_argument('--mode', '-m', action = 'store', dest = 'mode', 
-            choices = ['max', 'all'], default = 'max', 
-            help = 'Visualize mode, \'max\' mode will pick the greatest \
-                    activation in the feature map and set others to zero, \
-                    \'all\' mode will use all values in the feature map')
-    return parser
-
-
-def load_image(path):
-    img = Image.open(path).resize((224, 224))
-    img_array = np.array(img)[np.newaxis, :].astype(np.float)
-    return img_array
-
-
-def save_image(data, path):
-    data = data - data.min()
-    data *= 1.0 / (data.max() + 1e-8)
-    data = data[:, :, ::-1]
-    uint8_data = (data * 255).astype(np.uint8)
-    img = Image.fromarray(uint8_data, 'RGB')
-    img.save(path)
-
-
-def main():
-    parser = argparser()
-    args = parser.parse_args()
-    image_path = args.image
-    layer_name = args.layer_name
-    visualize_mode = args.mode
-
-    model = vgg16.VGG16(weights = 'imagenet', include_top = True)
-    model.summary()
-    layer_dict = dict([(layer.name, layer) for layer in model.layers])
-    if not layer_name in layer_dict:
-        print('Wrong layer name')
-        sys.exit()
-
-    # Load data and preprocess
-    img = vgg16.preprocess_input(load_image(image_path))
-
-    vis_model = VisualModel(model, layer_name)
-    vis_model.visualize( img
-                       , top_n = 5
-                       , max_only = visualize_mode == 'max'
-                       , save_img = lambda img, name: save_image(img, f'results/{layer_name}_{name}_{visualize_mode}.png')
-                       )
-
-
-if "__main__" == __name__:
-    main()
