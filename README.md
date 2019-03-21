@@ -1,4 +1,4 @@
-# keras-vis
+# keras-visual
 Visualisation framework for Tensorflow Keras models
 
 The repository currently holds:
