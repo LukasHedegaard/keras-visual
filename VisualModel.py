@@ -27,12 +27,16 @@ class VisLayer():
     down_func = lambda arg: None
     name: str = ''
 
-    def up(self, data, learning_phase = 0):
+    def up(self, data, learning_phase = 0):  # TODO: learning_phase can be removed as it is not used.
         self.up_data = self.up_func([data, learning_phase])
+        if isinstance(self.up_data, list):
+            self.up_data = self.up_data[0]
         return self.up_data
 
     def down(self, data, learning_phase = 0):
-        self.down_data= self.down_func([data, learning_phase])
+        self.down_data = self.down_func([data, learning_phase])
+        if isinstance(self.down_data, list):
+            self.down_data = self.down_data[0]
         return self.down_data
 
 
@@ -54,9 +58,9 @@ class VisConv2D(VisLayer):
             kernel_initializer = tf.constant_initializer(W),
             bias_initializer = tf.constant_initializer(b),
         )
-        self.up_func = K.function([i, K.learning_phase()], u(i))
+        self.up_func = K.function([i, K.learning_phase()], [u(i)])
 
-        W_t = np.moveaxis(W[::-1, ::-1, :, :], 2, 3) 
+        W_t = np.moveaxis(W[::-1, ::-1, :, :], 2, 3)
         b_t = np.zeros(W_t.shape[3])
         o = Input(shape = layer.output_shape[1:])
         d = Conv2D(
@@ -68,7 +72,7 @@ class VisConv2D(VisLayer):
             kernel_initializer=tf.constant_initializer(W_t),
             bias_initializer=tf.constant_initializer(b_t),
         )
-        self.down_func = K.function([o, K.learning_phase()], d(o))
+        self.down_func = K.function([o, K.learning_phase()], [d(o)])
 
 
 class VisDense(VisLayer):
@@ -84,7 +88,7 @@ class VisDense(VisLayer):
         i = Input(shape = layer.input_shape[1:])
         o = Dense(units = layer.output_shape[1])(i)
         o.weights = [W, b]
-        self.up_func = K.function([i, K.learning_phase()], o)
+        self.up_func = K.function([i, K.learning_phase()], [o])
         
         #Transpose W and set down_func for DDense
         W = W.transpose()
@@ -95,7 +99,7 @@ class VisDense(VisLayer):
         i = Input(shape = self.output_shape[1:])
         o = Dense(units = self.input_shape[1])(i)
         o.weights = flipped_weights
-        self.down_func = K.function([i, K.learning_phase()], o)
+        self.down_func = K.function([i, K.learning_phase()], [o])
 
 
 class VisMaxPooling2D(VisLayer):
@@ -112,24 +116,26 @@ class VisMaxPooling2D(VisLayer):
             padding = layer.padding,
             data_format = 'channels_last'
         )
-        self._maxpool = K.function([inp, K.learning_phase()], pool(inp))
+        self._maxpool = K.function([inp, K.learning_phase()], [pool(inp)])
 
-        out = inp = Input(shape = layer.output_shape[1:])
+        out = Input(shape = layer.output_shape[1:])
         ups_factor = int(layer.input_shape[1]/layer.output_shape[1])
         ups = UpSampling2D(size=(ups_factor, ups_factor))
-        self._upsample = K.function([out, K.learning_phase()], ups(out))
+        self._upsample = K.function([out, K.learning_phase()], [ups(out)])
         
         self._switches = np.zeros((1, *layer.input_shape[1:]))
     
 
     def up(self, data, learning_phase = 0):
-        self.up_data = self._maxpool([data, learning_phase])
-        self._switches = data == self._upsample([self.up_data, learning_phase])
+        self.up_data = self._maxpool([data, learning_phase])[0]
+        up_sampled_image = self._upsample([self.up_data, learning_phase])[0]
+        self._switches = data == up_sampled_image
         return self.up_data
     
 
     def down(self, data, learning_phase = 0):
-        self.down_data = self._upsample([data, learning_phase]) * self._switches
+        up_sampled_image = self._upsample([self.up_data, learning_phase])[0]
+        self.down_data = up_sampled_image * self._switches
         return self.down_data
 
 
@@ -144,8 +150,8 @@ class VisActivation(VisLayer):
         a = self.activation(i)
         # According to the original paper, 
         # In forward pass and backward pass, do the same activation(relu)
-        self.up_func = K.function([i, K.learning_phase()], a)
-        self.down_func = K.function([i, K.learning_phase()], a)
+        self.up_func = K.function([i, K.learning_phase()], [a])
+        self.down_func = K.function([i, K.learning_phase()], [a])
     
     
 class VisFlatten(VisLayer):
@@ -153,11 +159,11 @@ class VisFlatten(VisLayer):
         self.layer = layer
         self.name = layer.name
         self.shape = layer.input_shape[1:]
-        self.up_func = K.function([layer.input, K.learning_phase()], layer.output)
+        self.up_func = K.function([layer.input, K.learning_phase()], [layer.output])
 
     # Flatten 2D input into 1D output
     def up(self, data, learning_phase = 0):
-        self.up_data = self.up_func([data, learning_phase])
+        self.up_data = self.up_func([data, learning_phase])[0]
         return self.up_data
 
     # Reshape 1D input into 2D output
@@ -172,12 +178,12 @@ class VisInput(VisLayer):
     def __init__(self, layer: Input):
         self.layer = layer
         self.name = layer.name
-    
-    # input and output of Inputl layer are the same
+
+    # input and output of the Input layer are the same
     def up(self, data, learning_phase = 0):
         self.up_data = data
         return self.up_data
-    
+
     def down(self, data, learning_phase = 0):
         self.down_data = data
         return self.down_data
