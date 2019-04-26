@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-#coding=utf-8
 
 import numpy as np
 from typing import List
@@ -12,9 +11,9 @@ from tensorflow.keras.layers import (
     Dense
 )
 from tensorflow.keras.layers import (
-    Conv2D, 
+    Conv2D,
     Conv2DTranspose,
-    MaxPooling2D, 
+    MaxPooling2D,
     UpSampling2D
 )
 from tensorflow.keras.models import Model, Sequential
@@ -27,48 +26,47 @@ class VisLayer():
     down_func = lambda arg: None
     name: str = ''
 
-    def up(self, data, learning_phase = 0):  # TODO: learning_phase can be removed as it is not used.
+    def up(self, data, learning_phase=0):
         self.up_data = self.up_func([data, learning_phase])
-        if isinstance(self.up_data, list):
+        if isinstance(self.up_data, list) and len(self.up_data) == 1:
             self.up_data = self.up_data[0]
         return self.up_data
 
-    def down(self, data, learning_phase = 0):
+    def down(self, data, learning_phase=0):
         self.down_data = self.down_func([data, learning_phase])
-        if isinstance(self.down_data, list):
+        if isinstance(self.down_data, list) and len(self.down_data) == 1:
             self.down_data = self.down_data[0]
         return self.down_data
 
 
 class VisConv2D(VisLayer):
-    
-    def __init__(self, layer):
 
+    def __init__(self, layer):
         self.layer = layer
         self.name = layer.name
 
         W, b = layer.get_weights()
-        i = Input(shape = layer.input_shape[1:])
+        i = Input(shape=layer.input_shape[1:])
         u = Conv2D(
-            filters = layer.filters, 
-            kernel_size = layer.kernel_size, 
-            strides = layer.strides,
-            dilation_rate = layer.dilation_rate,
-            padding = layer.padding,
-            kernel_initializer = tf.constant_initializer(W),
-            bias_initializer = tf.constant_initializer(b),
+            filters=layer.filters,
+            kernel_size=layer.kernel_size,
+            strides=layer.strides,
+            dilation_rate=layer.dilation_rate,
+            padding=layer.padding,
+            kernel_initializer=tf.constant_initializer(W),
+            bias_initializer=tf.constant_initializer(b),
         )
         self.up_func = K.function([i, K.learning_phase()], [u(i)])
 
         W_t = np.moveaxis(W[::-1, ::-1, :, :], 2, 3)
         b_t = np.zeros(W_t.shape[3])
-        o = Input(shape = layer.output_shape[1:])
+        o = Input(shape=layer.output_shape[1:])
         d = Conv2D(
-            filters = W_t.shape[-1], 
-            kernel_size = W_t.shape[:2], 
-            strides = layer.strides,
-            dilation_rate = layer.dilation_rate,
-            padding = layer.padding,
+            filters=W_t.shape[-1],
+            kernel_size=W_t.shape[:2],
+            strides=layer.strides,
+            dilation_rate=layer.dilation_rate,
+            padding=layer.padding,
             kernel_initializer=tf.constant_initializer(W_t),
             bias_initializer=tf.constant_initializer(b_t),
         )
@@ -83,21 +81,21 @@ class VisDense(VisLayer):
         weights = layer.get_weights()
         W = weights[0]
         b = weights[1]
-        
-        #Set up_func for DDense
-        i = Input(shape = layer.input_shape[1:])
-        o = Dense(units = layer.output_shape[1])(i)
+
+        # Set up_func for DDense
+        i = Input(shape=layer.input_shape[1:])
+        o = Dense(units=layer.output_shape[1])(i)
         o.weights = [W, b]
         self.up_func = K.function([i, K.learning_phase()], [o])
-        
-        #Transpose W and set down_func for DDense
+
+        # Transpose W and set down_func for DDense
         W = W.transpose()
         self.input_shape = layer.input_shape
         self.output_shape = layer.output_shape
         b = np.zeros(self.input_shape[1])
         flipped_weights = [W, b]
-        i = Input(shape = self.output_shape[1:])
-        o = Dense(units = self.input_shape[1])(i)
+        i = Input(shape=self.output_shape[1:])
+        o = Dense(units=self.input_shape[1])(i)
         o.weights = flipped_weights
         self.down_func = K.function([i, K.learning_phase()], [o])
 
@@ -109,51 +107,47 @@ class VisMaxPooling2D(VisLayer):
         self.poolsize = layer.pool_size
 
         # set up functions
-        inp = Input(shape = layer.input_shape[1:])
+        inp = Input(shape=layer.input_shape[1:])
         pool = MaxPooling2D(
-            pool_size = layer.pool_size,
-            strides = layer.strides,
-            padding = layer.padding,
-            data_format = 'channels_last'
+            pool_size=layer.pool_size,
+            strides=layer.strides,
+            padding=layer.padding,
+            data_format='channels_last'
         )
         self._maxpool = K.function([inp, K.learning_phase()], [pool(inp)])
 
-        out = Input(shape = layer.output_shape[1:])
-        ups_factor = int(layer.input_shape[1]/layer.output_shape[1])
+        out = inp = Input(shape=layer.output_shape[1:])
+        ups_factor = int(layer.input_shape[1] / layer.output_shape[1])
         ups = UpSampling2D(size=(ups_factor, ups_factor))
         self._upsample = K.function([out, K.learning_phase()], [ups(out)])
-        
+
         self._switches = np.zeros((1, *layer.input_shape[1:]))
-    
 
-    def up(self, data, learning_phase = 0):
+    def up(self, data, learning_phase=0):
         self.up_data = self._maxpool([data, learning_phase])[0]
-        up_sampled_image = self._upsample([self.up_data, learning_phase])[0]
-        self._switches = data == up_sampled_image
+        self._switches = data == self._upsample([self.up_data, learning_phase])[0]
         return self.up_data
-    
 
-    def down(self, data, learning_phase = 0):
-        up_sampled_image = self._upsample([self.up_data, learning_phase])[0]
-        self.down_data = up_sampled_image * self._switches
+    def down(self, data, learning_phase=0):
+        self.down_data = self._upsample([data, learning_phase])[0] * self._switches
         return self.down_data
 
 
 class VisActivation(VisLayer):
-    def __init__(self, layer: Activation, linear = False):
+    def __init__(self, layer: Activation, linear=False):
         self.layer = layer
         self.name = layer.name
         self.linear = linear
         self.activation = layer.activation
-        i = K.placeholder(shape = layer.output_shape)
+        i = K.placeholder(shape=layer.output_shape)
 
         a = self.activation(i)
-        # According to the original paper, 
+        # According to the original paper,
         # In forward pass and backward pass, do the same activation(relu)
         self.up_func = K.function([i, K.learning_phase()], [a])
         self.down_func = K.function([i, K.learning_phase()], [a])
-    
-    
+
+
 class VisFlatten(VisLayer):
     def __init__(self, layer: Flatten):
         self.layer = layer
@@ -162,12 +156,12 @@ class VisFlatten(VisLayer):
         self.up_func = K.function([layer.input, K.learning_phase()], [layer.output])
 
     # Flatten 2D input into 1D output
-    def up(self, data, learning_phase = 0):
+    def up(self, data, learning_phase=0):
         self.up_data = self.up_func([data, learning_phase])[0]
         return self.up_data
 
     # Reshape 1D input into 2D output
-    def down(self, data, learning_phase = 0):
+    def down(self, data, learning_phase=0):
         new_shape = [data.shape[0]] + list(self.shape)
         assert np.prod(self.shape) == np.prod(data.shape[1:])
         self.down_data = np.reshape(data, new_shape)
@@ -179,12 +173,12 @@ class VisInput(VisLayer):
         self.layer = layer
         self.name = layer.name
 
-    # input and output of the Input layer are the same
-    def up(self, data, learning_phase = 0):
+    # input and output of Inputl layer are the same
+    def up(self, data, learning_phase=0):
         self.up_data = data
         return self.up_data
 
-    def down(self, data, learning_phase = 0):
+    def down(self, data, learning_phase=0):
         self.down_data = data
         return self.down_data
 
@@ -193,11 +187,11 @@ class VisModel():
     layers: List[VisLayer] = []
 
     def __init__(self, model: Model
-                     , layer_name = ''):
+                 , layer_name=''):
         self.layer_name = layer_name
 
         for l in model.layers:
-            if   isinstance(l, Conv2D):
+            if isinstance(l, Conv2D):
                 self.layers.append(VisConv2D(l))
                 self.layers.append(VisActivation(l))
             elif isinstance(l, MaxPooling2D):
@@ -216,16 +210,14 @@ class VisModel():
             if l.name == layer_name:
                 break
 
-    
     def visualize(self, data
-                      , top_n: int
-                      , max_only = False
-                      , save_img = lambda img, name: None ):
+                  , top_n: int
+                  , max_only=False
+                  , save_img=lambda img, name: None):
         up_data = self.up(data)
         for rank, feat, d in self.get_top_features(up_data, top_n, max_only):
             down_data = self.down(d)
-            save_img(np.array(down_data).squeeze(), rank+1, feat)
-
+            save_img(np.array(down_data).squeeze(), rank + 1, feat)
 
     def up(self, data):
         self.layers[0].up(data)
@@ -234,13 +226,12 @@ class VisModel():
 
         return self.layers[-1].up_data
 
-
-    def get_top_features(self, data, n: int, max_only = False):
+    def get_top_features(self, data, n: int, max_only=False):
         ''' Returns iterable yielding tuples of (ranking, feature_index, output_data)'''
 
         # compute max for each feature
-        f_max = np.array(list(map( 
-            lambda f: data[...,f].max(),
+        f_max = np.array(list(map(
+            lambda f: data[..., f].max(),
             range(data.shape[-1]),
         )))
 
@@ -257,12 +248,9 @@ class VisModel():
             o[..., ind] = feature_map
             yield (j, ind, o)
 
-
-
     def down(self, data):
         self.layers[-1].down(data)
         for j in reversed(range(len(self.layers[:-1]))):
-            self.layers[j].down(self.layers[j+1].down_data)
+            self.layers[j].down(self.layers[j + 1].down_data)
 
         return self.layers[0].down_data
-        
