@@ -21,29 +21,28 @@ import tensorflow.keras.backend as K
 
 
 class VisLayer:
-    """ Abstract base class for deconv layers"""
-    up_func = lambda arg: None
-    down_func = lambda arg: None
-    name: str = ''
-
-    def up(self, data):
-        self.up_data = self.up_func([data])
-        if isinstance(self.up_data, list) and len(self.up_data) == 1:
-            self.up_data = self.up_data[0]
-        return self.up_data
-
-    def down(self, data):
-        self.down_data = self.down_func([data])
-        if isinstance(self.down_data, list) and len(self.down_data) == 1:
-            self.down_data = self.down_data[0]
-        return self.down_data
-
-
-class VisConv2D(VisLayer):
-
     def __init__(self, layer):
         self.layer = layer
         self.name = layer.name
+        self.up_func = lambda arg: 0
+        self.down_func = lambda arg: 0
+
+    def up(self, data):
+        up_data = self.up_func([data])
+        if isinstance(up_data, list) and len(up_data) == 1:
+            up_data = up_data[0]
+        return up_data
+
+    def down(self, data):
+        down_data = self.down_func([data])
+        if isinstance(down_data, list) and len(down_data) == 1:
+            down_data = down_data[0]
+        return down_data
+
+
+class VisConv2D(VisLayer):
+    def __init__(self, layer: Conv2D):
+        super().__init__(layer)
 
         W, b = layer.get_weights()
         i = Input(shape=layer.input_shape[1:])
@@ -75,8 +74,7 @@ class VisConv2D(VisLayer):
 
 class VisDense(VisLayer):
     def __init__(self, layer: Dense):
-        self.layer = layer
-        self.name = layer.name
+        super().__init__(layer)
 
         weights = layer.get_weights()
         W = weights[0]
@@ -102,9 +100,7 @@ class VisDense(VisLayer):
 
 class VisMaxPooling2D(VisLayer):
     def __init__(self, layer: MaxPooling2D):
-        self.layer = layer
-        self.name = layer.name
-        self.poolsize = layer.pool_size
+        super().__init__(layer)
 
         # set up functions
         inp = Input(shape=layer.input_shape[1:])
@@ -116,7 +112,7 @@ class VisMaxPooling2D(VisLayer):
         )
         self._maxpool = K.function([inp], [pool(inp)])
 
-        out = inp = Input(shape=layer.output_shape[1:])
+        out = Input(shape=layer.output_shape[1:])
         ups_factor = int(layer.input_shape[1] / layer.output_shape[1])
         ups = UpSampling2D(size=(ups_factor, ups_factor))
         self._upsample = K.function([out], [ups(out)])
@@ -124,19 +120,17 @@ class VisMaxPooling2D(VisLayer):
         self._switches = np.zeros((1, *layer.input_shape[1:]))
 
     def up(self, data):
-        self.up_data = self._maxpool([data])[0]
-        self._switches = data == self._upsample([self.up_data])[0]
-        return self.up_data
+        up_data = self._maxpool([data])[0]
+        self._switches = data == self._upsample([up_data])[0]
+        return up_data
 
     def down(self, data):
-        self.down_data = self._upsample([data])[0] * self._switches
-        return self.down_data
+        return self._upsample([data])[0] * self._switches
 
 
 class VisActivation(VisLayer):
     def __init__(self, layer: Activation, linear=False):
-        self.layer = layer
-        self.name = layer.name
+        super().__init__(layer)
         self.linear = linear
         self.activation = layer.activation
         i = K.placeholder(shape=layer.output_shape)
@@ -150,40 +144,33 @@ class VisActivation(VisLayer):
 
 class VisFlatten(VisLayer):
     def __init__(self, layer: Flatten):
-        self.layer = layer
-        self.name = layer.name
+        super().__init__(layer)
         self.shape = layer.input_shape[1:]
         self.up_func = K.function([layer.input], [layer.output])
 
-    # Flatten 2D input into 1D output
     def up(self, data):
-        self.up_data = self.up_func([data])[0]
-        return self.up_data
+        # Flatten 2D input into 1D output
+        return self.up_func([data])[0]
 
-    # Reshape 1D input into 2D output
     def down(self, data):
+        # Reshape 1D input into 2D output
         new_shape = [data.shape[0]] + list(self.shape)
-        assert np.prod(self.shape) == np.prod(data.shape[1:])
-        self.down_data = np.reshape(data, new_shape)
-        return self.down_data
+        return np.reshape(data, new_shape)
 
 
 class VisInput(VisLayer):
     def __init__(self, layer: Input):
-        self.layer = layer
-        self.name = layer.name
+        super().__init__(layer)
 
-    # input and output of Inputl layer are the same
+    # Input and output of Input layer are the same
     def up(self, data):
-        self.up_data = data
-        return self.up_data
+        return data
 
     def down(self, data):
-        self.down_data = data
-        return self.down_data
+        return data
 
 
-class VisModel():
+class VisModel:
     layers: List[VisLayer] = []
 
     def __init__(self, model: Model
@@ -221,11 +208,11 @@ class VisModel():
             save_img(np.array(down_data).squeeze(), rank + 1, feat)
 
     def up(self, data):
-        self.layers[0].up(data)
+        up_data = self.layers[0].up(data)
         for j in range(1, len(self.layers)):
-            self.layers[j].up(self.layers[j - 1].up_data)
+            up_data = self.layers[j].up(up_data)
 
-        return self.layers[-1].up_data
+        return up_data
 
     def get_top_features(self, data, n: int, max_only=False):
         ''' Returns iterable yielding tuples of (ranking, feature_index, output_data)'''
@@ -250,11 +237,11 @@ class VisModel():
             yield (j, ind, o)
 
     def down(self, data):
-        self.layers[-1].down(data)
+        down_data = self.layers[-1].down(data)
         for j in reversed(range(len(self.layers[:-1]))):
-            self.layers[j].down(self.layers[j + 1].down_data)
+            down_data = self.layers[j].down(down_data)
 
-        return self.layers[0].down_data
+        return down_data
 
     def down_bound(self, up_data):
         top_features = list(self.get_top_features(up_data, n=1, max_only=True))
