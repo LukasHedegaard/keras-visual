@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import numpy as np
+import math
 from typing import List
 import tensorflow as tf
 from tensorflow.keras.layers import (
@@ -18,14 +19,23 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.models import Model, Sequential
 import tensorflow.keras.backend as K
+from PIL import Image
+
+
+def reconstruct_image(img_arr):
+    img_arr = np.squeeze(img_arr)
+    img_arr = img_arr - img_arr.min()
+    img_arr *= 1.0 / (img_arr.max() + 1e-8)
+    uint8_data = (img_arr * 255).astype(np.uint8)
+    return Image.fromarray(uint8_data, 'RGB')
 
 
 class VisLayer:
     def __init__(self, layer):
         self.layer = layer
         self.name = layer.name
-        self.up_func = lambda arg: 0
-        self.down_func = lambda arg: 0
+        self.up_func = lambda data: data
+        self.down_func = lambda data: data
 
     def up(self, data):
         up_data = self.up_func([data])
@@ -57,7 +67,10 @@ class VisConv2D(VisLayer):
         )
         self.up_func = K.function([i], [u(i)])
 
-        W_t = np.moveaxis(W[::-1, ::-1, :, :], 2, 3)
+        # Flip each filter vertically and horizontally
+        W_flipped = W[::-1, ::-1, :, :]
+        # Ensure the reconstructed image has correct number of channels
+        W_t = np.moveaxis(W_flipped, 2, 3)
         b_t = np.zeros(W_t.shape[3])
         o = Input(shape=layer.output_shape[1:])
         d = Conv2D(
@@ -102,20 +115,19 @@ class VisMaxPooling2D(VisLayer):
     def __init__(self, layer: MaxPooling2D):
         super().__init__(layer)
 
-        # set up functions
-        inp = Input(shape=layer.input_shape[1:])
+        i = Input(shape=layer.input_shape[1:])
         pool = MaxPooling2D(
             pool_size=layer.pool_size,
             strides=layer.strides,
             padding=layer.padding,
             data_format='channels_last'
         )
-        self._maxpool = K.function([inp], [pool(inp)])
+        self._maxpool = K.function([i], [pool(i)])
 
-        out = Input(shape=layer.output_shape[1:])
+        o = Input(shape=layer.output_shape[1:])
         ups_factor = int(layer.input_shape[1] / layer.output_shape[1])
         ups = UpSampling2D(size=(ups_factor, ups_factor))
-        self._upsample = K.function([out], [ups(out)])
+        self._upsample = K.function([o], [ups(o)])
 
         self._switches = np.zeros((1, *layer.input_shape[1:]))
 
@@ -162,7 +174,6 @@ class VisInput(VisLayer):
     def __init__(self, layer: Input):
         super().__init__(layer)
 
-    # Input and output of Input layer are the same
     def up(self, data):
         return data
 
@@ -173,13 +184,13 @@ class VisInput(VisLayer):
 class VisModel:
     layers: List[VisLayer] = []
 
-    def __init__(self, model: Model
-                 , layer_name=''):
+    def __init__(self, model: Model, layer_name):
         self.layer_name = layer_name
+        self.layer_info = []
+        self.receptive_field_info = dict()
 
         for l in model.layers:
             if isinstance(l, Conv2D):
-
                 self.layers.append(VisConv2D(l))
                 self.layers.append(VisActivation(l))
             elif isinstance(l, MaxPooling2D):
@@ -192,16 +203,23 @@ class VisModel:
             elif isinstance(l, Flatten):
                 self.layers.append(VisFlatten(l))
             elif isinstance(l, InputLayer):
+                img_size = l.input_shape[1]
+                self.layer_info.append([img_size, 1, 1, 0.5])
                 self.layers.append(VisInput(l))
             else:
                 raise ValueError(f'Cannot handle this type of layer: \n{l.get_config()}')
+
+            # Compute layer info
+            if isinstance(l, Conv2D) or isinstance(l, MaxPooling2D):
+                filter_params = self.get_filter_params(l)
+                current_layer_info = self.compute_layer_info(filter_params, self.layer_info[-1])
+                self.layer_info.append(current_layer_info)
+                self.receptive_field_info[l.name] = current_layer_info
+
             if l.name == layer_name:
                 break
 
-    def visualize(self, data
-                  , top_n: int
-                  , max_only=False
-                  , save_img=lambda img, name: None):
+    def visualize(self, data, top_n: int, max_only=False, save_img=lambda img, name: None):
         up_data = self.up(data)
         for rank, feat, d in self.get_top_features(up_data, top_n, max_only):
             down_data = self.down(d)
@@ -211,13 +229,41 @@ class VisModel:
         up_data = self.layers[0].up(data)
         for j in range(1, len(self.layers)):
             up_data = self.layers[j].up(up_data)
-
         return up_data
+
+    def down(self, data):
+        down_data = self.layers[-1].down(data)
+        for j in reversed(range(len(self.layers[:-1]))):
+            down_data = self.layers[j].down(down_data)
+
+        return down_data
+
+    def visualise_cropped(self, preprocessed_img_data, original_img):
+        up_data = self.up(preprocessed_img_data)
+
+        result = list(self.get_top_features(up_data, n=1, max_only=True))
+        rank, top_filter_idx, feature_maps = result[0]
+        down_data = self.down(feature_maps)
+
+        # Find crop region
+        top_feature_map = feature_maps[:, :, :, top_filter_idx]
+        feature_idx = top_feature_map.argmax()
+        recp_info = self.receptive_field_info[self.layers[-1].layer.name]
+        output_size, jump, receptive_size, start = recp_info
+        center_point = int((feature_idx*jump + start*jump) % 224)
+        crop_pos = center_point - int(receptive_size / 2)
+        crop_box = (crop_pos, crop_pos, crop_pos + receptive_size, crop_pos + receptive_size)
+
+        reconstructed_img = reconstruct_image(down_data)
+
+        cropped_reconstruction = reconstructed_img.crop(crop_box)
+        cropped_original = original_img.crop(crop_box)
+        return cropped_reconstruction, cropped_original
 
     def get_top_features(self, data, n: int, max_only=False):
         ''' Returns iterable yielding tuples of (ranking, feature_index, output_data)'''
 
-        # compute max for each feature
+        # Find the largest activation for each feature map
         f_max = np.array(list(map(
             lambda f: data[..., f].max(),
             range(data.shape[-1]),
@@ -236,12 +282,24 @@ class VisModel:
             o[..., ind] = feature_map
             yield (j, ind, o)
 
-    def down(self, data):
-        down_data = self.layers[-1].down(data)
-        for j in reversed(range(len(self.layers[:-1]))):
-            down_data = self.layers[j].down(down_data)
+    def compute_layer_info(self, layer_filter_params, prev_layer_info):
+        n_in = prev_layer_info[0]
+        j_in = prev_layer_info[1]
+        r_in = prev_layer_info[2]
+        start_in = prev_layer_info[3]
+        k = layer_filter_params[0]
+        s = layer_filter_params[1]
+        p = layer_filter_params[2]
 
-        return down_data
+        n_out = math.floor((n_in - k + 2 * p) / s) + 1
+        actualP = (n_out - 1) * s - n_in + k
+        pR = math.ceil(actualP / 2)
+        pL = math.floor(actualP / 2)
+
+        j_out = j_in * s
+        r_out = r_in + (k - 1) * j_in
+        start_out = start_in + ((k - 1) / 2 - pL) * j_in
+        return n_out, j_out, r_out, start_out
 
     def down_bound(self, up_data):
         top_features = list(self.get_top_features(up_data, n=1, max_only=True))
@@ -254,6 +312,9 @@ class VisModel:
         filter_size, stride, padding = self.get_filter_params(prev_layer)
         batch, width, height = top_feature_map.shape
         highest_act_index = top_feature_map.argmax()
+
+        print(f'Filter Index: {top_feature_idx}')
+        print(f'Highest activation index: {highest_act_index}')
 
         print('  Width: {} Height: {}, Filter'.format(width, height))
 
