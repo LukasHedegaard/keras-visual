@@ -1,4 +1,5 @@
 from tensorflow.keras.applications import vgg16
+from tensorflow.keras.layers import Conv2D
 import os
 from PIL import Image
 import numpy as np
@@ -7,6 +8,7 @@ from importlib import reload
 import argparse as ap
 from pathlib import Path
 from imagenet_labels import imagenet_labels
+from tqdm import tqdm
 
 
 def load_image(path):
@@ -41,10 +43,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def generate_visualisations(model, layer_name, preprocessed_image, prefix):
-    reload(VisualModel)
+def generate_visualisations(model, layer_name, preprocessed_image, prefix, pbar):
+    output_dir = Path(f'output/{layer_name}')
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    reload(VisualModel)  # Reload model to avoid strange error
     vis_model = VisualModel.VisModel(model, layer_name)
 
+    # Forward pass
     feature_maps = vis_model.up(preprocessed_image)
 
     for filter_index in range(feature_maps.shape[-1]):
@@ -53,14 +59,10 @@ def generate_visualisations(model, layer_name, preprocessed_image, prefix):
         output[..., filter_index] = feature_map * (feature_map == feature_map.max())
 
         projected_img_data = vis_model.down(output).squeeze()
-        image_path = f'vis/{prefix}_{layer_name}_filter{filter_index}.jpg'
-        save_image(projected_img_data, image_path)
-    # vis_model.visualize(preprocessed_image
-    #                     , top_n=1
-    #                     , max_only=True
-    #                     , save_img=lambda img, rank, feat: save_image(img,
-    #                                                                   f'results/{prefix}_{layer_name}_top{rank}_feature{feat}_max.jpg')
-    #                     )
+        image_path = output_dir / f'{prefix}_filter{filter_index}.jpg'
+
+        save_image(projected_img_data, str(image_path))
+        pbar.update(1)
 
 
 def main():
@@ -72,6 +74,9 @@ def main():
     print('Loading the model...')
     model = vgg16.VGG16(weights='imagenet', include_top=True)
 
+    conv_layers = [l for l in model.layers if isinstance(l, Conv2D)]
+    total_steps = np.sum([l.filters for l in conv_layers])
+
     image_paths = [image_dir / fn for fn in os.listdir(image_dir)]
     for image_path in image_paths:
         original_image = Image.open(image_path).resize((224, 224))
@@ -82,13 +87,16 @@ def main():
         prediction = model.predict(preprocessed_img)
         pred_label_index = np.argmax(prediction, axis=1)[0]
         predicted_class = imagenet_labels[pred_label_index]
-        print(f'Image {image_path} -> {predicted_class}')
+        print(f'Prediction for image {image_path} is "{predicted_class}"')
 
         # Get image name without file extension
         prefix = image_path.name.split('.')[0]
 
-        print(f'Visualising features for {image_path}...')
-        generate_visualisations(model, 'block3_conv3', preprocessed_img, prefix)
+        print(f'Visualising features ...')
+
+        with tqdm(total=total_steps) as pbar:
+            for layer in conv_layers:
+                generate_visualisations(model, layer.name, preprocessed_img, prefix, pbar)
 
     print('Done!')
 
