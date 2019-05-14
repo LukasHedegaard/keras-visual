@@ -33,8 +33,8 @@ def parse_args():
     parser.add_argument('--image-path', '-i',
                         type=check_image_path,
                         required=False,
-                        default='husky.jpg',
-                        help=f'The path of the image. Default: husky.jpg')
+                        default='images/husky-01.jpg',
+                        help=f'The path of the image. Default: images/husky-01.jpg')
     parser.add_argument('--layer-name', '-l',
                         type=str,
                         required=False,
@@ -59,7 +59,7 @@ def main():
 
     vis_layer_name = args['layer_name']  # 'block3_conv3'
     vis_mode = args['mode']  # 'max'
-    image_path = args['image_path']  # 'husky.jpg'
+    image_path = args['image_path']  # 'images/husky-01.jpg'
 
     print('Loading the model...')
     model = vgg16.VGG16(weights='imagenet', include_top=True)
