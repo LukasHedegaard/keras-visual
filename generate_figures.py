@@ -14,7 +14,7 @@ import os
 from os import path
 from pathlib import Path
 from glob import glob
-from PIL import Image
+from PIL import Image, ImageFont, ImageDraw
 import re
 
 
@@ -25,6 +25,15 @@ def load_filter_image(filter_img):
     foreground = Image.open(filter_img).convert('RGBA')
     foreground.putalpha(240)
     return Image.alpha_composite(background, foreground)
+
+
+def load_filter_image_with_filter_index(filter_img):
+    image = load_filter_image(filter_img)
+    filter_index = re.findall(r'filter(\d+)', filter_img)[0]
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype("arial.ttf", 20)
+    draw.text((5, 200), f'#{filter_index}', (255, 255, 255), font=font)
+    return image
 
 
 def combine_horizontally(images, output_path):
@@ -42,7 +51,7 @@ def combine_horizontally(images, output_path):
 
 
 def visualise_filter(layer_name, filter_index):
-    search_query = path.join('output', layer_name, f'*filter{filter_index}.jpg')
+    search_query = path.join('output', 'all', layer_name, f'*filter{filter_index}.jpg')
     image_paths = glob(search_query)
     filter_images = list(map(load_filter_image, image_paths))
     output_dir = Path('figures') / layer_name
