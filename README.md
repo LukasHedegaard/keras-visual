@@ -9,7 +9,8 @@ See `usage.py` for an example.
 
 
 ## Authors
-* Lukas Hedegaard - _initial work_
+* [Omar Ali Sheikh-Omar](www.github.com/sheikhomar)
+* [Lukas Hedegaard](www.github.com/LukasHedegaard)
 
 ## Acknowledgments
 * Forked from [Deconvnet-keras](https://github.com/jalused/Deconvnet-keras)
